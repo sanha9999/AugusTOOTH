@@ -1,103 +1,91 @@
-import torch
 import torch.nn as nn
+from torch.nn.modules import dropout
+import torchvision.models as models
+from torch.nn import functional as F
 
-class UNet(nn.Module):
-  def __init__(self):
-    super(UNet,self).__init__()
-    def CBR2d(in_channels,out_channels,kernel_size=3,stride=1,padding=1,bias=True):
-      #convolutionBatch Normalization ReLu
-      layers=[]
-      layers+=[nn.Conv2d(in_channels=in_channels,out_channels=out_channels,kernel_size=kernel_size,stride=stride,padding=padding,bias=bias)]
+class ReNet(nn.modules):
 
-      layers+=[nn.BatchNorm2d(num_features=out_channels)]
-      layers+=[nn.ReLU()]
-      cbr=nn.Sequential(*layers)
+    def __init__(self, n_input, n_units, patch_size=(1, 1)):
+        super(ReNet, self).__init__()
 
-      return cbr
+        self.patch_size_height = int(patch_size[0])
+        self.patch_size_width = int(patch_size[1])
 
-    #Contracting path
-    self.enc1_1 = CBR2d(in_channels=1,out_channels=64)
-    self.enc1_2 = CBR2d(in_channels=64,out_channels=64)
+        # Horizontal RNN
+        self.rnn_hor = nn.GRU(input_size = n_input*self.patch_size_width*self.patch_size_height, hidden_size=n_units,
+        num_layers=1, bias=True, batch_first=True, dropout=0, bidirectional=True)
 
-    self.pool1=nn.MaxPool2d(kernel_size=2)
+        # Vertical RNN
+        self.rnn_ver = nn.GRU(input_size = 2 * n_units, hidden_size=n_units, num_layer=1, bias=True, batch_first=True,
+        dropout=0, bidirectional=True)
     
-    self.enc2_1 = CBR2d(in_channels=64,out_channels=128)
-    self.enc2_2 = CBR2d(in_channels=128,out_channels=128)
+    def rnn_forward(self, x, hor_or_ver):
+        assert hor_or_ver in ['hor', 'ver']
 
-    self.pool2=nn.MaxPool2d(kernel_size=2)
+        b, n_height, n_width, n_filters = x.size()
 
-    self.enc3_1 = CBR2d(in_channels=128,out_channels=512)
-    self.enc3_2 = CBR2d(in_channels=512,out_channels=512)
+        x = x.view(b * n_height, n_width, n_filters)
+        if hor_or_ver == 'hor':
+            x, _ = self.rnn_hor(x)
+        else:
+            x, _ = self.rnn_ver(x)
+        x = x.contiguous()
+        x = x.view(b, n_height, n_width, -1)
 
-    self.pool4=nn.MaxPool2d(kernel_size=2)
+        return x
     
-    self.enc5_1=CBR2d(in_channels=512,out_channels=1024)
-    #Expensive path
-    self.dex5_1=CBR2d(in_channels=1024,out_channels=512)
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)      
+        x = x.contiguous()
+        x = self.rnn_forward(x, 'hor') 
+        x = x.permute(0, 2, 1, 3)      
+        x = x.contiguous()
+        x = self.rnn_forward(x, 'ver') 
+        x = x.permute(0, 2, 1, 3)      
+        x = x.contiguous()
+        x = x.permute(0, 3, 1, 2)      
+        x = x.contiguous()
 
-    self.unpool4=nn.convTranspose2d(in_channels=512,out_channels=512,kernel_size=2,stride=2,padding=0,bias=True)
-   
-    self.dec4_2 = CBR2d(inchannels=2*512,out_channels=512)
-    self.dec4_1 = CBR2d(inchannels=512,out_channels=256)
+        return x
 
-    self.unpool3=nn.convTranspose2d(in_channels=256,out_channels=256,kernel_size=2,stride=2,padding=0,bias=True)
-   
-    self.dec3_2 = CBR2d(inchannels=2*256,out_channels=256)
-    self.dec3_1 = CBR2d(inchannels=256,out_channels=128)
+class CNN(nn.Module):
+    def __init__(self):
+        super(CNN, self).__init__()
+
+        self.model = models.__dict__['vgg16'](pretrained=True)
+        self.model = nn.Sequential(*list(self.model.children())[0]) 
+        self.model = nn.Sequential(*list(self.model.children())[:16])
     
-    self.unpool2=nn.convTranspose2d(in_channels=256,out_channels=256,kernel_size=2,stride=2,padding=0,bias=True)
-   
-    self.dec2_2 = CBR2d(inchannels=2*128,out_channels=128)
-    self.dec2_1 = CBR2d(inchannels=128,out_channels=64)
-    
-    self.unpool1=nn.convTranspose2d(in_channels=256,out_channels=256,kernel_size=2,stride=2,padding=0,bias=True)
-   
-    self.dec1_2 = CBR2d(inchannels=2*64,out_channels=64)
-    self.dec1_1 = CBR2d(inchannels=64,out_channels=64)
-    
-    self.fc=nn.Conv2d(in_channels=64,out_channels=1,kernel_size=1,padding=0,bias=True)
-  
-  def forward(self,x):
-    enc1_1=self.enc1_1(x)
-    enc1_2=self.enc1_2(enc1_1)
-    pool1=self.pool1(enc1_2)
+    def forward(self, x):
 
-    enc2_1=self.enc2_1(pool1)
-    enc2_2=self.enc2_2(enc2_1)
-    pool2=self.pool2(enc2_2)
+        b, n_channel, n_height, n_width = x.size()
+        x = self.model(x)
 
-    enc3_1=self.enc3_1(pool2)
-    enc3_2=self.enc3_2(enc3_1)
-    pool3=self.pool3(enc3_2)
+        return x
 
-    enc4_1=self.enc4_1(pool3)
-    enc4_2=self.enc4_2(enc4_1)
-    pool4=self.pool4(enc4_2)
+class Architecture(nn.Module):
 
-    enc5_1=self.enc5_1(pool4)
+    def __init__(self, n_classes, usegpu=True):
+        super(Architecture, self).__init__()
 
-    dec5_1=self.dec5_1(enc5_1)
+        self.n_classes = n_classes
 
-    unpool4=self.unpool3(dec5_1)
-    cat4=torch.cat(unpool4,enc4_2,dim=1)
-    dec4_2=self.dec4_2(cat4)
-    dec4_1=self.dec4_1(dec4_2)
+        self.cnn = CNN(usegpu=usegpu)
+        self.renet1 = ReNet(256, 100, usegpu=usegpu)
+        self.renet2 = ReNet(100 * 2, 100, usegpu=usegpu)
+        self.upsampling1 = nn.ConvTranspose2d(100 * 2, 50, kernel_size=(2, 2), stride=(2, 2))
+        self.relu1 = nn.ReLU()
+        self.upsampling2 = nn.ConvTranspose2d(50, 50, kernel_size=(2, 2), stride=(2, 2))
+        self.relu2 = nn.ReLU()
+        self.output = nn.Conv2d(50, self.n_classes, kernel_size=(1, 1), stride=(1, 1))
 
-    unpool3=self.unpool3(dec4_1)
-    cat3=torch.cat(unpool3,enc3_2,dim=1)
-    dec3_2=self.dec3_2(cat3)
-    dec3_1=self.dec3_1(dec3_2)
+    def forward(self, x):
+        x = self.cnn(x)
+        x = self.renet1(x)
+        x = self.renet2(x)
+        x = self.relu1(self.upsampling1(x))
+        x = self.relu2(self.upsampling2(x))
+        x = self.output(x)
+        return x
 
-    unpool2=self.unpool2(dec3_1)
-    cat2=torch.cat(unpool2,enc2_2,dim=1)
-    dec2_2=self.dec2_2(cat2)
-    dec2_1=self.dec2_1(dec2_2)
 
-    unpool1=self.unpool3(dec2_1)
-    cat1=torch.cat(unpool1,enc1_2,dim=1)
-    dec1_2=self.dec1_2(cat1)
-    dec1_1=self.dec1_1(dec1_2)
-
-    x=self.fc(dec1_1)
-
-    return x
